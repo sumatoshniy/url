@@ -3,6 +3,7 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from datetime import datetime, timedelta
 import cx_Oracle
 import io
+import os
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret123'
@@ -50,7 +51,7 @@ def load_user(user_id):
 
 # Функция для проверки наличия PDF для договора
 def has_pdf_for_contract(contract_num):
-    """Проверяет, есть ли PDF файл для договора"""
+    """Проверяет, есть ли PDF файл для договора (URL или DIR)"""
     try:
         connection = get_oracle_connection()
         if not connection:
@@ -61,6 +62,7 @@ def has_pdf_for_contract(contract_num):
             SELECT COUNT(*) 
             FROM CONTRACT_PDF 
             WHERE CONTRACT_NUM = :contract_num
+            AND (URL IS NOT NULL OR DIR IS NOT NULL)
         """, contract_num=contract_num)
 
         count = cursor.fetchone()[0]
@@ -70,6 +72,49 @@ def has_pdf_for_contract(contract_num):
         return count > 0
     except cx_Oracle.Error:
         return False
+
+
+def get_pdf_source(contract_num):
+    """Получает источник PDF (URL или DIR) для договора"""
+    try:
+        connection = get_oracle_connection()
+        if not connection:
+            return None
+
+        cursor = connection.cursor()
+        cursor.execute("""
+            SELECT URL, DIR, FILE_NAME
+            FROM CONTRACT_PDF 
+            WHERE CONTRACT_NUM = :contract_num
+        """, contract_num=contract_num)
+
+        result = cursor.fetchone()
+        cursor.close()
+        connection.close()
+
+        if not result:
+            return None
+
+        url, dir_path, file_name = result
+
+        # Определяем источник с приоритетом: URL > DIR
+        source_type = None
+        source_value = None
+
+        if url:
+            source_type = "url"
+            source_value = url
+        elif dir_path:
+            source_type = "dir"
+            source_value = dir_path
+
+        return {
+            'source_type': source_type,
+            'source_value': source_value,
+            'file_name': file_name or f"{contract_num}.pdf"
+        }
+    except cx_Oracle.Error:
+        return None
 
 
 # Функция проверки прав администратора (по email)
@@ -414,6 +459,53 @@ def contracts():
                            has_contracts_in_period=False, custom_dates=False, is_admin=check_admin())
 
 
+def send_local_pdf(pdf_info, contract_num):
+    """Отправляет PDF с локального диска"""
+    try:
+        dir_path = pdf_info['source_value']
+        file_name = pdf_info['file_name']
+
+        # Проверяем, является ли путь файлом
+        if os.path.isfile(dir_path):
+            # Это прямой путь к файлу
+            file_path = dir_path
+        elif os.path.isdir(dir_path):
+            # Это директория - ищем PDF файлы
+            pdf_files = [f for f in os.listdir(dir_path)
+                         if f.lower().endswith('.pdf')]
+
+            if not pdf_files:
+                flash(f'В директории {dir_path} не найдены PDF файлы', 'danger')
+                return redirect(url_for('contracts'))
+
+            # Ищем файл по имени из БД
+            if file_name and os.path.exists(os.path.join(dir_path, file_name)):
+                file_path = os.path.join(dir_path, file_name)
+            else:
+                # Берем первый найденный PDF
+                file_path = os.path.join(dir_path, pdf_files[0])
+        else:
+            flash(f'Файл или директория не найдены: {dir_path}', 'danger')
+            return redirect(url_for('contracts'))
+
+        # Проверяем существование файла
+        if not os.path.exists(file_path):
+            flash(f'Файл не найден: {file_path}', 'danger')
+            return redirect(url_for('contracts'))
+
+        # Отправляем файл
+        return send_file(
+            file_path,
+            mimetype='application/pdf',
+            as_attachment=False,
+            download_name=os.path.basename(file_path)
+        )
+
+    except Exception as e:
+        flash(f'Ошибка при чтении файла с диска: {str(e)}', 'danger')
+        return redirect(url_for('contracts'))
+
+
 # Маршрут для загрузки PDF для админа
 @app.route("/upload_pdf", methods=['GET', 'POST'])
 @login_required
@@ -424,23 +516,13 @@ def upload_pdf():
 
     if request.method == 'POST':
         contract_num = request.form.get('contract_num', '').strip()
-        pdf_file = request.files.get('pdf_file')
+        storage_type = request.form.get('storage_type', 'url')  # url или dir
 
         if not contract_num:
             flash('Введите номер договора', 'danger')
             return redirect(url_for('upload_pdf'))
 
-        if not pdf_file or not pdf_file.filename:
-            flash('Выберите PDF файл', 'danger')
-            return redirect(url_for('upload_pdf'))
-
-        if not pdf_file.filename.lower().endswith('.pdf'):
-            flash('Файл должен быть в формате PDF', 'danger')
-            return redirect(url_for('upload_pdf'))
-
         try:
-            pdf_content = pdf_file.read()
-
             connection = get_oracle_connection()
             if not connection:
                 flash('Ошибка подключения к базе данных', 'danger')
@@ -448,37 +530,84 @@ def upload_pdf():
 
             cursor = connection.cursor()
 
+            # Проверяем существование записи
             cursor.execute("""
                 SELECT COUNT(*) 
                 FROM CONTRACT_PDF 
                 WHERE CONTRACT_NUM = :contract_num
             """, contract_num=contract_num)
-
             exists = cursor.fetchone()[0] > 0
 
-            if exists:
-                cursor.execute("""
-                    UPDATE CONTRACT_PDF 
-                    SET PDF_CONTENT = :pdf_content,
-                        FILE_NAME = :file_name,
-                        UPLOAD_DATE = SYSDATE
-                    WHERE CONTRACT_NUM = :contract_num
-                """, {
-                    'pdf_content': pdf_content,
-                    'file_name': pdf_file.filename,
-                    'contract_num': contract_num
-                })
-                message = 'PDF файл обновлен'
-            else:
-                cursor.execute("""
-                    INSERT INTO CONTRACT_PDF (CONTRACT_NUM, PDF_CONTENT, FILE_NAME)
-                    VALUES (:contract_num, :pdf_content, :file_name)
-                """, {
-                    'contract_num': contract_num,
-                    'pdf_content': pdf_content,
-                    'file_name': pdf_file.filename
-                })
-                message = 'PDF файл успешно загружен'
+            if storage_type == 'url':
+                # Сохранение URL
+                url = request.form.get('pdf_url', '').strip()
+
+                if not url:
+                    flash('Введите URL', 'danger')
+                    return redirect(url_for('upload_pdf'))
+
+                # Валидация URL
+                if not url.startswith(('http://', 'https://')):
+                    flash('Введите корректный URL (должен начинаться с http:// или https://)', 'danger')
+                    return redirect(url_for('upload_pdf'))
+
+                if exists:
+                    cursor.execute("""
+                        UPDATE CONTRACT_PDF 
+                        SET URL = :url,
+                            DIR = NULL,
+                            FILE_NAME = :file_name,
+                            UPLOAD_DATE = SYSDATE
+                        WHERE CONTRACT_NUM = :contract_num
+                    """, {
+                        'url': url,
+                        'file_name': request.form.get('file_name', 'document.pdf'),
+                        'contract_num': contract_num
+                    })
+                else:
+                    cursor.execute("""
+                        INSERT INTO CONTRACT_PDF (CONTRACT_NUM, URL, FILE_NAME)
+                        VALUES (:contract_num, :url, :file_name)
+                    """, {
+                        'contract_num': contract_num,
+                        'url': url,
+                        'file_name': request.form.get('file_name', 'document.pdf')
+                    })
+
+                message = 'URL сохранен'
+
+            elif storage_type == 'dir':
+                # Сохранение локального пути
+                dir_path = request.form.get('pdf_dir', '').strip()
+
+                if not dir_path:
+                    flash('Введите путь к файлу или директории', 'danger')
+                    return redirect(url_for('upload_pdf'))
+
+                if exists:
+                    cursor.execute("""
+                        UPDATE CONTRACT_PDF 
+                        SET DIR = :dir,
+                            URL = NULL,
+                            FILE_NAME = :file_name,
+                            UPLOAD_DATE = SYSDATE
+                        WHERE CONTRACT_NUM = :contract_num
+                    """, {
+                        'dir': dir_path,
+                        'file_name': request.form.get('file_name', 'document.pdf'),
+                        'contract_num': contract_num
+                    })
+                else:
+                    cursor.execute("""
+                        INSERT INTO CONTRACT_PDF (CONTRACT_NUM, DIR, FILE_NAME)
+                        VALUES (:contract_num, :dir, :file_name)
+                    """, {
+                        'contract_num': contract_num,
+                        'dir': dir_path,
+                        'file_name': request.form.get('file_name', 'document.pdf')
+                    })
+
+                message = 'Путь к файлу сохранен'
 
             connection.commit()
             cursor.close()
@@ -488,10 +617,10 @@ def upload_pdf():
             return redirect(url_for('contracts'))
 
         except cx_Oracle.Error as e:
-            flash(f'Ошибка при загрузке файла: {e}', 'danger')
+            flash(f'Ошибка базы данных: {e}', 'danger')
             return redirect(url_for('upload_pdf'))
         except Exception as e:
-            flash(f'Ошибка при обработке файла: {e}', 'danger')
+            flash(f'Ошибка: {e}', 'danger')
             return redirect(url_for('upload_pdf'))
 
     return render_template('upload_pdf.html')
@@ -513,24 +642,34 @@ def manage_pdf():
 
         cursor = connection.cursor()
 
-        # Получаем все PDF файлы
+        # Получаем все PDF файлы (только URL и DIR)
         cursor.execute("""
-            SELECT CONTRACT_NUM, FILE_NAME, UPLOAD_DATE 
+            SELECT 
+                CONTRACT_NUM, 
+                FILE_NAME, 
+                UPLOAD_DATE,
+                URL,
+                DIR
             FROM CONTRACT_PDF 
+            WHERE URL IS NOT NULL OR DIR IS NOT NULL
             ORDER BY UPLOAD_DATE DESC
         """)
 
         pdf_files = cursor.fetchall()
 
-        # Форматируем даты
+        # Форматируем данные
         formatted_pdfs = []
         for pdf in pdf_files:
-            contract_num, file_name, upload_date = pdf
+            contract_num, file_name, upload_date, url, dir_path = pdf
+
             upload_date_str = upload_date.strftime('%d.%m.%Y %H:%M:%S') if upload_date else ''
+
             formatted_pdfs.append({
                 'contract_num': contract_num,
                 'file_name': file_name,
-                'upload_date': upload_date_str
+                'upload_date': upload_date_str,
+                'url': url,
+                'dir': dir_path
             })
 
         cursor.close()
@@ -568,8 +707,13 @@ def delete_pdf(contract_num):
         exists = cursor.fetchone()[0] > 0
 
         if exists:
+            # Удаляем только URL и DIR, оставляем запись
             cursor.execute("""
-                DELETE FROM CONTRACT_PDF 
+                UPDATE CONTRACT_PDF 
+                SET URL = NULL,
+                    DIR = NULL,
+                    FILE_NAME = NULL,
+                    UPLOAD_DATE = SYSDATE
                 WHERE CONTRACT_NUM = :contract_num
             """, contract_num=contract_num)
 
@@ -577,16 +721,16 @@ def delete_pdf(contract_num):
             cursor.close()
             connection.close()
 
-            flash('PDF файл успешно удален', 'success')
+            flash('Информация о PDF файле удалена', 'success')
         else:
             cursor.close()
             connection.close()
-            flash('PDF файл не найден', 'warning')
+            flash('Запись не найдена', 'warning')
 
         return redirect(url_for('contracts'))
 
     except cx_Oracle.Error as e:
-        flash(f'Ошибка при удалении файла: {e}', 'danger')
+        flash(f'Ошибка при удалении: {e}', 'danger')
         return redirect(url_for('contracts'))
 
 
@@ -595,62 +739,29 @@ def delete_pdf(contract_num):
 @login_required
 def view_pdf(contract_num):
     try:
-        connection = get_oracle_connection()
-        if not connection:
-            flash('Ошибка подключения к базе данных', 'danger')
+        # Получаем информацию о PDF
+        pdf_info = get_pdf_source(contract_num)
+
+        if not pdf_info or not pdf_info['source_type']:
+            flash('PDF файл не найден', 'danger')
             return redirect(url_for('contracts'))
 
-        cursor = connection.cursor()
+        source_type = pdf_info['source_type']
 
-        # Получаем BLOB и имя файла
-        cursor.execute("""
-            SELECT PDF_CONTENT, FILE_NAME 
-            FROM CONTRACT_PDF 
-            WHERE CONTRACT_NUM = :contract_num
-        """, contract_num=contract_num)
+        if source_type == "url":
+            # Редирект на внешний URL
+            return redirect(pdf_info['source_value'])
 
-        result = cursor.fetchone()
+        elif source_type == "dir":
+            # Отправка файла с локального диска
+            return send_local_pdf(pdf_info, contract_num)
 
-        if not result:
-            # Пробуем найти по частичному совпадению
-            cursor.execute("""
-                SELECT PDF_CONTENT, FILE_NAME 
-                FROM CONTRACT_PDF 
-                WHERE CONTRACT_NUM LIKE '%' || :contract_num || '%'
-            """, contract_num=contract_num)
+        else:
+            flash('PDF файл не найден', 'danger')
+            return redirect(url_for('contracts'))
 
-            result = cursor.fetchone()
-
-            if not result:
-                cursor.close()
-                connection.close()
-                flash('PDF файл не найден', 'danger')
-                return redirect(url_for('contracts'))
-
-        # Прочтение BLOB
-        pdf_blob, file_name = result
-
-        # Почтение BLOB перед закрытием курсора
-        pdf_data = pdf_blob.read()
-
-        cursor.close()
-        connection.close()
-
-        # Создаем объект BytesIO из прочитанных данных
-        pdf_io = io.BytesIO(pdf_data)
-
-        return send_file(
-            pdf_io,
-            mimetype='application/pdf',
-            as_attachment=False,
-            download_name=file_name
-        )
-
-    except cx_Oracle.Error:
-        flash('Ошибка при получении файла', 'danger')
-        return redirect(url_for('contracts'))
-    except Exception:
-        flash('Ошибка при обработке файла', 'danger')
+    except Exception as e:
+        flash(f'Ошибка при получении файла: {str(e)}', 'danger')
         return redirect(url_for('contracts'))
 
 
