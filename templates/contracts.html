@@ -12,9 +12,12 @@
             <div class="d-flex justify-content-between align-items-start mb-3">
                 <h5 class="card-title mb-0">Фильтр по дате регистрации договора</h5>
                 {% if is_admin %}
-                <div>
+                <div class="btn-group">
                     <a href="{{ url_for('upload_pdf') }}" class="btn btn-success btn-sm">
-                        PDF
+                        Добавить PDF
+                    </a>
+                    <a href="{{ url_for('manage_pdf') }}" class="btn btn-info btn-sm">
+                        Управление PDF
                     </a>
                 </div>
                 {% endif %}

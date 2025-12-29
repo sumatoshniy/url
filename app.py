@@ -552,10 +552,11 @@ def upload_pdf():
                     return redirect(url_for('upload_pdf'))
 
                 if exists:
+                    # ОБНОВЛЕНИЕ существующей записи
                     cursor.execute("""
                         UPDATE CONTRACT_PDF 
                         SET URL = :url,
-                            DIR = NULL,
+                            DIR = NULL,  # Очищаем DIR если был
                             FILE_NAME = :file_name,
                             UPLOAD_DATE = SYSDATE
                         WHERE CONTRACT_NUM = :contract_num
@@ -564,7 +565,9 @@ def upload_pdf():
                         'file_name': request.form.get('file_name', 'document.pdf'),
                         'contract_num': contract_num
                     })
+                    message = 'URL обновлен'
                 else:
+                    # СОЗДАНИЕ новой записи
                     cursor.execute("""
                         INSERT INTO CONTRACT_PDF (CONTRACT_NUM, URL, FILE_NAME)
                         VALUES (:contract_num, :url, :file_name)
@@ -573,8 +576,7 @@ def upload_pdf():
                         'url': url,
                         'file_name': request.form.get('file_name', 'document.pdf')
                     })
-
-                message = 'URL сохранен'
+                    message = 'URL сохранен'
 
             elif storage_type == 'dir':
                 # Сохранение локального пути
@@ -585,10 +587,11 @@ def upload_pdf():
                     return redirect(url_for('upload_pdf'))
 
                 if exists:
+                    # ОБНОВЛЕНИЕ существующей записи
                     cursor.execute("""
                         UPDATE CONTRACT_PDF 
                         SET DIR = :dir,
-                            URL = NULL,
+                            URL = NULL,  # Очищаем URL если был
                             FILE_NAME = :file_name,
                             UPLOAD_DATE = SYSDATE
                         WHERE CONTRACT_NUM = :contract_num
@@ -597,7 +600,9 @@ def upload_pdf():
                         'file_name': request.form.get('file_name', 'document.pdf'),
                         'contract_num': contract_num
                     })
+                    message = 'Путь к файлу обновлен'
                 else:
+                    # СОЗДАНИЕ новой записи
                     cursor.execute("""
                         INSERT INTO CONTRACT_PDF (CONTRACT_NUM, DIR, FILE_NAME)
                         VALUES (:contract_num, :dir, :file_name)
@@ -606,8 +611,7 @@ def upload_pdf():
                         'dir': dir_path,
                         'file_name': request.form.get('file_name', 'document.pdf')
                     })
-
-                message = 'Путь к файлу сохранен'
+                    message = 'Путь к файлу сохранен'
 
             connection.commit()
             cursor.close()
@@ -707,13 +711,9 @@ def delete_pdf(contract_num):
         exists = cursor.fetchone()[0] > 0
 
         if exists:
-            # Удаляем только URL и DIR, оставляем запись
+            # ПОЛНОЕ УДАЛЕНИЕ ЗАПИСИ ИЗ ТАБЛИЦЫ
             cursor.execute("""
-                UPDATE CONTRACT_PDF 
-                SET URL = NULL,
-                    DIR = NULL,
-                    FILE_NAME = NULL,
-                    UPLOAD_DATE = SYSDATE
+                DELETE FROM CONTRACT_PDF 
                 WHERE CONTRACT_NUM = :contract_num
             """, contract_num=contract_num)
 
@@ -721,16 +721,16 @@ def delete_pdf(contract_num):
             cursor.close()
             connection.close()
 
-            flash('Информация о PDF файле удалена', 'success')
+            flash('PDF файл успешно удален', 'success')
         else:
             cursor.close()
             connection.close()
-            flash('Запись не найдена', 'warning')
+            flash('PDF файл не найден', 'warning')
 
         return redirect(url_for('contracts'))
 
     except cx_Oracle.Error as e:
-        flash(f'Ошибка при удалении: {e}', 'danger')
+        flash(f'Ошибка при удалении файла: {e}', 'danger')
         return redirect(url_for('contracts'))
 
 
